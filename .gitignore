@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Backup / temporary scripts
+refined_train_test_full_backup.py
+
+# Generated model weights
+results_refined/*.h5
+
+# Checkpoint generated during interrupted/resumable runs
+results_refined/*checkpoint*.csv
+
+# Keep final experimental results
+!results_refined/refined_train_test_raw.csv
+!results_refined/refined_train_test_aggregated.csv
+
+# Keep final plots
+!results_refined/plots_bar/
+!results_refined/plots_bar/*.png
