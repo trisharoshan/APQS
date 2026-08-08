@@ -63,10 +63,12 @@ The checkpoint CSV is an intermediate resume file and is intentionally excluded 
 
 ### `plot_refined_results_bar.py`
 
-Plotting script that reads the aggregated experimental results and generates six grouped bar plots:
+Plotting script that reads the aggregated experimental results and generates twelve grouped bar plots:
 
 - Average latency vs task count for Light, Medium, and Heavy workloads.
 - Average energy vs task count for Light, Medium, and Heavy workloads.
+- Deadline-met rate vs task count for Light, Medium, and Heavy workloads.
+- Number of failed Tasks vs task count for Light, Medium, and Heavy workloads.
 
 ### `results_refined/`
 
