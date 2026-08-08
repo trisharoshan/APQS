@@ -1,4 +1,4 @@
-# APQS: Adaptive Priority-Queue Scheduler with DQN
+# APQS: Intelligent Priority-Aware Task Scheduling in Heterogeneous Environments Using Deep Q-Network
 
 This repository contains the implementation and refined experimental results for the **Adaptive Priority-Queue Scheduler (APQS)**, a Deep Q-Network (DQN) based task offloading policy for hierarchical IoT–Edge–Fog–Cloud environments.
 
