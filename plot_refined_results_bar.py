@@ -1,77 +1,164 @@
 import os
+
 import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
-
-# === Paths ===
-BASE_DIR = 'results_refined'
-AGG_CSV = os.path.join(BASE_DIR, 'refined_train_test_aggregated.csv')
-PLOT_DIR = os.path.join(BASE_DIR, 'plots_bar')
-
-os.makedirs(PLOT_DIR, exist_ok=True)
-
-# === Load aggregated results ===
-df = pd.read_csv(AGG_CSV)
-
-WORKLOADS = ['Light', 'Medium', 'Heavy']
-METRICS = [
-    ('avg_latency_mean', 'Average Latency (ms)', 'latency'),
-    ('avg_energy_mean', 'Average Energy (Wh)', 'energy'),
-]
 
 
-def plot_grouped_bar(sub, y_col, y_label, filename, title):
-    """
-    Creates a grouped bar chart:
-      x-axis: task_count
-      groups: different approaches
-      y-axis: y_col
-    """
-    # Ensure sorted for consistent grouping
-    sub = sub.copy()
-    sub.sort_values(['task_count', 'approach'], inplace=True)
+AGG_CSV = "results_refined/refined_train_test_aggregated.csv"
+PLOT_DIR = "results_refined/plots_bar"
 
-    task_counts = sorted(sub['task_count'].unique())
-    approaches = sorted(sub['approach'].unique())
+WORKLOADS = ["Light", "Medium", "Heavy"]
 
-    # Bar positions
-    x = np.arange(len(task_counts))  # task_count groups
-    width = 0.8 / len(approaches)    # total width ~0.8
 
-    plt.figure(figsize=(8, 5))
+def plot_metric(df, workload, metric_mean, ylabel, title, filename):
+    """Generate a grouped bar plot for one metric and workload."""
 
-    for i, approach in enumerate(approaches):
-        g = sub[sub['approach'] == approach]
-        # Make sure values are aligned with task_counts
-        y = [g[g['task_count'] == tc][y_col].values[0] for tc in task_counts]
-        plt.bar(x + i * width, y, width, label=approach)
+    subset = df[df["workload_type"] == workload].copy()
 
-    plt.xlabel('Number of Tasks')
-    plt.ylabel(y_label)
-    plt.title(title)
-    plt.xticks(x + width * (len(approaches) - 1) / 2, task_counts)
-    plt.grid(axis='y', linestyle='--', alpha=0.4)
-    plt.legend()
+    if subset.empty:
+        print(f"[WARNING] No data found for workload: {workload}")
+        return
+
+    pivot = subset.pivot(
+        index="task_count",
+        columns="approach",
+        values=metric_mean
+    )
+
+    # Keep task counts in numerical order.
+    pivot = pivot.sort_index()
+
+    ax = pivot.plot(
+        kind="bar",
+        figsize=(10, 6)
+    )
+
+    ax.set_xlabel("Number of Tasks")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+
+    ax.set_xticklabels(
+        [str(x) for x in pivot.index],
+        rotation=0
+    )
+
+    ax.legend(
+        title="Scheduler",
+        loc="best"
+    )
+
+    ax.grid(
+        axis="y",
+        linestyle="--",
+        alpha=0.4
+    )
+
     plt.tight_layout()
 
-    out_path = os.path.join(PLOT_DIR, filename)
-    plt.savefig(out_path, dpi=300)
+    output_path = os.path.join(PLOT_DIR, filename)
+
+    plt.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
     plt.close()
-    print(f'[OK] Saved: {out_path}')
+
+    print(f"[SAVED] {output_path}")
 
 
 def main():
-    for wl in WORKLOADS:
-        sub = df[df['workload_type'] == wl]
-        if sub.empty:
-            print(f'[WARN] No data for workload_type={wl}')
-            continue
+    os.makedirs(PLOT_DIR, exist_ok=True)
 
-        for y_col, y_label, prefix in METRICS:
-            title = f'{y_label} vs task count ({wl} workload)'
-            filename = f'{prefix}_vs_tasks_{wl.lower()}_bar.png'
-            plot_grouped_bar(sub, y_col, y_label, filename, title)
+    print(f"Loading: {AGG_CSV}")
+
+    df = pd.read_csv(AGG_CSV)
+
+    required_columns = {
+        "workload_type",
+        "approach",
+        "task_count",
+        "avg_latency_mean",
+        "avg_energy_mean",
+        "deadline_met_rate_mean",
+        "failed_tasks_mean",
+    }
+
+    missing = required_columns - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            "The aggregated CSV is missing these columns: "
+            + ", ".join(sorted(missing))
+        )
+
+   
+    # Average latency plots
+    
+
+    for workload in WORKLOADS:
+        workload_lower = workload.lower()
+
+        plot_metric(
+            df=df,
+            workload=workload,
+            metric_mean="avg_latency_mean",
+            ylabel="Average Latency (ms)",
+            title=f"Average Latency vs Number of Tasks — {workload} Workload",
+            filename=f"latency_vs_tasks_{workload_lower}_bar.png",
+        )
+
+    
+    # Average energy plots
+    
+
+    for workload in WORKLOADS:
+        workload_lower = workload.lower()
+
+        plot_metric(
+            df=df,
+            workload=workload,
+            metric_mean="avg_energy_mean",
+            ylabel="Average Energy (Wh)",
+            title=f"Average Energy vs Number of Tasks — {workload} Workload",
+            filename=f"energy_vs_tasks_{workload_lower}_bar.png",
+        )
+
+    
+    # Deadline-met-rate plots
+    
+
+    for workload in WORKLOADS:
+        workload_lower = workload.lower()
+
+        plot_metric(
+            df=df,
+            workload=workload,
+            metric_mean="deadline_met_rate_mean",
+            ylabel="Deadline Met Rate (%)",
+            title=f"Deadline Met Rate vs Number of Tasks — {workload} Workload",
+            filename=f"deadline_met_rate_vs_tasks_{workload_lower}_bar.png",
+        )
+
+    
+    # Failed-task plots
+   
+
+    for workload in WORKLOADS:
+        workload_lower = workload.lower()
+
+        plot_metric(
+            df=df,
+            workload=workload,
+            metric_mean="failed_tasks_mean",
+            ylabel="Average Failed Tasks",
+            title=f"Failed Tasks vs Number of Tasks — {workload} Workload",
+            filename=f"failed_tasks_vs_tasks_{workload_lower}_bar.png",
+        )
+
+    print("\nAll plots generated successfully.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
