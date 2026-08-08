@@ -76,7 +76,7 @@ Contains the final experimental results and plots used for analysis:
 
 - `refined_train_test_raw.csv`: per-experiment results.
 - `refined_train_test_aggregated.csv`: means and standard deviations across the five repeats.
-- `plots_bar/`: six final bar plots.
+- `plots_bar/`: twelve final bar plots.
 
 ---
 
