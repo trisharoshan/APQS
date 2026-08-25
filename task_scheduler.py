@@ -41,13 +41,16 @@ class WorkloadConfig:
 
 
 class Task:
-    def __init__(self, taskid, arrivaltime, datasize, cpurequirement, deadline, priority=5):
+    def __init__(self, taskid, arrivaltime, datasize, cpurequirement,
+                 deadline, priority=5):
         self.taskid = taskid
-        self.arrivaltime = arrivaltime
+        self.arrivaltime = float(arrivaltime)
         self.datasize = float(datasize)
         self.cpurequirement = float(cpurequirement)
         self.deadline = float(deadline)
         self.priority = int(priority)
+        self.source_device = None
+
         self.starttime = None
         self.completiontime = None
         self.executionlocation = None
@@ -56,14 +59,19 @@ class Task:
         self.waitingtime = 0.0
         self.servicetime = 0.0
         self.computenode = None
+        self.executed = False
+        self.accepted = False
+        self.rejected = False
+        self.rejectionreason = None
 
     def meetsdeadline(self):
-        return self.actuallatency <= self.deadline
+        return self.executed and self.actuallatency <= self.deadline
 
 
 class Device:
-    def __init__(self, deviceid, devicetype, cpughz, memorygb, bandwidthmbps, powerwatts,
-                 location=(0, 0), propagation_factor_ms_per_unit=0.005):
+    def __init__(self, deviceid, devicetype, cpughz, memorygb,
+                 bandwidthmbps, powerwatts, location=(0, 0),
+                 propagation_factor_ms_per_unit=0.005):
         self.deviceid = deviceid
         self.devicetype = devicetype
         self.cpughz = float(cpughz)
@@ -110,35 +118,42 @@ class DQNAgent:
             keras.layers.Dense(32, activation='relu'),
             keras.layers.Dense(self.actionsize, activation='linear')
         ])
-        model.compile(loss='mse', optimizer=keras.optimizers.Adam(learning_rate=self.learningrate))
+        model.compile(
+            loss='mse',
+            optimizer=keras.optimizers.Adam(
+                learning_rate=self.learningrate
+            )
+        )
         return model
 
     def remember(self, state, action, reward, nextstate, done):
         self.memory.append((state, action, reward, nextstate, done))
 
-    def act(self, state):
-        if (not TF_AVAILABLE) or (self.model is None):
-            return random.randrange(self.actionsize)
-        if np.random.random() <= self.epsilon:
-            return random.randrange(self.actionsize)
-        state_input = state[np.newaxis, :] if state.ndim == 1 else state
-        qvalues = self.model.predict(state_input, verbose=0)[0]
-        return int(np.argmax(qvalues))
-
     def replay(self, batchsize=32):
-        if (not TF_AVAILABLE) or (self.model is None) or len(self.memory) < batchsize:
+        if not TF_AVAILABLE or self.model is None:
             return
+        if len(self.memory) < batchsize:
+            return
+
         minibatch = random.sample(self.memory, batchsize)
-        states = np.vstack([sample[0] for sample in minibatch])
-        nextstates = np.vstack([sample[3] for sample in minibatch])
-        targetf = self.model.predict(states, verbose=0)
+        states = np.vstack([item[0] for item in minibatch])
+        nextstates = np.vstack([item[3] for item in minibatch])
+        targets = self.model.predict(states, verbose=0)
         nextq = self.model.predict(nextstates, verbose=0)
+
         for i, (_, action, reward, _, done) in enumerate(minibatch):
-            target = reward if done else reward + self.gamma * np.max(nextq[i])
-            targetf[i][action] = target
-        self.model.fit(states, targetf, epochs=1, verbose=0)
+            targets[i][action] = (
+                reward
+                if done
+                else reward + self.gamma * np.max(nextq[i])
+            )
+
+        self.model.fit(states, targets, epochs=1, verbose=0)
         if self.epsilon > self.epsilonmin:
-            self.epsilon = max(self.epsilonmin, self.epsilon * self.epsilondecay)
+            self.epsilon = max(
+                self.epsilonmin,
+                self.epsilon * self.epsilondecay
+            )
 
 
 class PriorityScheduler:
@@ -165,33 +180,30 @@ class PriorityScheduler:
         return None
 
     def isempty(self):
-        return not (self.highqueue or self.mediumqueue or self.lowqueue)
+        return not (
+            self.highqueue or self.mediumqueue or self.lowqueue
+        )
 
     def queuelength(self):
-        return len(self.highqueue) + len(self.mediumqueue) + len(self.lowqueue)
+        return (
+            len(self.highqueue)
+            + len(self.mediumqueue)
+            + len(self.lowqueue)
+        )
 
 
 class NoPriorityScheduler:
     def __init__(self):
         self.queue = deque()
-        self.highqueue = deque()
-        self.mediumqueue = deque()
-        self.lowqueue = deque()
 
     def addtask(self, task):
         self.queue.append(task)
-        self.highqueue.append(task)
 
     def getnexttask(self):
-        if not self.queue:
-            return None
-        task = self.queue.popleft()
-        if self.highqueue:
-            self.highqueue.popleft()
-        return task
+        return self.queue.popleft() if self.queue else None
 
     def isempty(self):
-        return len(self.queue) == 0
+        return not self.queue
 
     def queuelength(self):
         return len(self.queue)
@@ -200,7 +212,8 @@ class NoPriorityScheduler:
 class EdgeFogSimulator:
     ACTION_NAMES = ['local', 'edge', 'fog', 'cloud']
 
-    def __init__(self, num_iot=50, num_edge=5, num_fog=2, workload_config=None):
+    def __init__(self, num_iot=50, num_edge=5, num_fog=2,
+                 workload_config=None):
         self.numiot = num_iot
         self.numedge = num_edge
         self.numfog = num_fog
@@ -211,28 +224,33 @@ class EdgeFogSimulator:
         self.cloud = self.createcloud()
         self.agent = DQNAgent(statesize=30, actionsize=4)
         self.scheduler = PriorityScheduler()
-        self.completedtasks = []
-        self.currenttime = 0.0
-        self.taskcounter = 0
+        self.reset_runtime()
 
     def reset_runtime(self):
         self.completedtasks = []
+        self.submittedtasks = []
+        self.queuedtasks = []
+        self.rejectedtasks = []
         self.currenttime = 0.0
         self.taskcounter = 0
         self.scheduler = self.scheduler.__class__()
-        for d in self.iotdevices + self.edgenodes + self.fognodes + [self.cloud]:
-            d.availablecpu = 100.0
-            d.availablememory = d.memorygb
-            d.battery = 100.0
-            d.busy_until = 0.0
+
+        for device in (
+            self.iotdevices
+            + self.edgenodes
+            + self.fognodes
+            + [self.cloud]
+        ):
+            device.availablecpu = 100.0
+            device.availablememory = device.memorygb
+            device.battery = 100.0
+            device.busy_until = 0.0
 
     def createiotdevices(self):
         return [
             Device(
-                f'iot{i}', 'iot',
-                random.uniform(0.5, 1.5),
-                random.uniform(0.5, 2.0),
-                random.uniform(5, 20),
+                f'iot{i}', 'iot', random.uniform(0.5, 1.5),
+                random.uniform(0.5, 2.0), random.uniform(5, 20),
                 random.uniform(1, 5),
                 (random.uniform(0, 500), random.uniform(0, 500))
             )
@@ -242,10 +260,8 @@ class EdgeFogSimulator:
     def createedgenodes(self):
         return [
             Device(
-                f'edge{i}', 'edge',
-                random.uniform(2, 4),
-                random.uniform(8, 16),
-                random.uniform(100, 300),
+                f'edge{i}', 'edge', random.uniform(2, 4),
+                random.uniform(8, 16), random.uniform(100, 300),
                 random.uniform(50, 100),
                 (random.uniform(100, 400), random.uniform(100, 400))
             )
@@ -255,206 +271,210 @@ class EdgeFogSimulator:
     def createfognodes(self):
         return [
             Device(
-                f'fog{i}', 'fog',
-                random.uniform(4, 8),
-                random.uniform(32, 64),
-                random.uniform(500, 1000),
-                random.uniform(150, 300),
-                (250, 250)
+                f'fog{i}', 'fog', random.uniform(4, 8),
+                random.uniform(32, 64), random.uniform(500, 1000),
+                random.uniform(150, 300), (250, 250)
             )
             for i in range(self.numfog)
         ]
 
     def createcloud(self):
-        return Device('cloud0', 'cloud', 16.0, 256.0, 5000.0, 15.0, (250, 250))
+        return Device(
+            'cloud0', 'cloud', 16.0, 256.0,
+            5000.0, 15.0, (250, 250)
+        )
 
     def generatetask(self):
         cfg = self.workload_config
         task = Task(
-            taskid=self.taskcounter,
-            arrivaltime=self.currenttime,
-            datasize=random.uniform(cfg.size_low, cfg.size_high),
-            cpurequirement=random.randint(cfg.cpu_low, cfg.cpu_high),
-            deadline=random.randint(cfg.dl_low, cfg.dl_high),
-            priority=random.randint(cfg.priority_low, cfg.priority_high)
+            self.taskcounter, self.currenttime,
+            random.uniform(cfg.size_low, cfg.size_high),
+            random.randint(cfg.cpu_low, cfg.cpu_high),
+            random.randint(cfg.dl_low, cfg.dl_high),
+            random.randint(cfg.priority_low, cfg.priority_high)
         )
         self.taskcounter += 1
         return task
 
-    def getstate(self, task, source):
-        def norm(x, scale):
-            return float(x) / float(scale) if scale > 0 else 0.0
+    def candidate_nodes(self, source):
+        return [
+            source,
+            min(self.edgenodes, key=lambda n: source.distance_to(n)),
+            min(self.fognodes, key=lambda n: source.distance_to(n)),
+            self.cloud
+        ]
 
-        if hasattr(self.scheduler, 'queuelength'):
-            queue_len = self.scheduler.queuelength()
+    def estimate_node_outcome(self, task, node, source):
+        if node.deviceid == source.deviceid:
+            transmission = 0.0
+            propagation = 0.0
         else:
-            queue_len = len(getattr(self.scheduler, 'queue', []))
+            transmission = (
+                task.datasize * 8.0
+            ) / max(node.bandwidthmbps, 1e-9)
+            propagation = source.propagation_delay_to(node)
 
-        candidate_nodes = [source]
-        nearest_edge = min(self.edgenodes, key=lambda e: source.distance_to(e))
-        nearest_fog = min(self.fognodes, key=lambda f: source.distance_to(f))
-        candidate_nodes.extend([nearest_edge, nearest_fog, self.cloud])
+        ready = self.currenttime + transmission + propagation
+        waiting = max(0.0, node.busy_until - ready)
+        execution = task.cpurequirement / max(node.mips, 1e-9)
+        latency = transmission + propagation + waiting + execution
+        energy = node.powerwatts * execution / 1000.0
+        return latency, energy
 
-        current_time = self.currenttime
-        task_slack = task.deadline
+    def admit_task(self, task, source):
+        task.source_device = source
+        self.queuedtasks.append(task)
+        self.scheduler.addtask(task)
+        return True
 
+    def getstate(self, task, source):
+        def norm(value, scale):
+            return float(value) / scale if scale > 0 else 0.0
+
+        queue_len = self.scheduler.queuelength()
         state = [
             norm(task.datasize, 200.0),
             norm(task.cpurequirement, 20000.0),
             norm(task.deadline, 150.0),
             norm(task.priority, 10.0),
-            norm(task_slack, 150.0),
-            norm(queue_len, 2000.0),
+            norm(task.deadline, 150.0),
+            norm(queue_len, 2000.0)
         ]
 
-        for node in candidate_nodes:
-            transmission = 0.0 if node.deviceid == source.deviceid else (task.datasize * 8.0) / max(node.bandwidthmbps, 1e-9)
-            propagation = 0.0 if node.deviceid == source.deviceid else source.propagation_delay_to(node)
-            ready_time = current_time + transmission + propagation
-            waiting = max(0.0, node.busy_until - ready_time)
-            exec_time = task.cpurequirement / max(node.mips, 1e-9)
-            finish_time = transmission + propagation + waiting + exec_time
-            slack_after = task.deadline - finish_time
+        for node in self.candidate_nodes(source):
+            if node.deviceid == source.deviceid:
+                transmission = 0.0
+                propagation = 0.0
+            else:
+                transmission = (
+                    task.datasize * 8.0
+                ) / max(node.bandwidthmbps, 1e-9)
+                propagation = source.propagation_delay_to(node)
+
+            ready = self.currenttime + transmission + propagation
+            waiting = max(0.0, node.busy_until - ready)
+            execution = task.cpurequirement / max(node.mips, 1e-9)
+            finish = transmission + propagation + waiting + execution
+            slack = task.deadline - finish
 
             state.extend([
                 norm(node.mips, 20000.0),
                 norm(node.powerwatts, 500.0),
                 norm(waiting, 500.0),
-                norm(exec_time, 500.0),
-                norm(finish_time, 1000.0),
-                norm(slack_after, 200.0),
+                norm(execution, 500.0),
+                norm(finish, 1000.0),
+                norm(slack, 200.0)
             ])
 
-        return np.array(state, dtype=np.float32)
+        return np.asarray(state, dtype=np.float32)
 
-    def map_action_to_node(self, action, sourcedevice):
+    def map_action_to_node(self, action, source):
         if action == 0:
-            return sourcedevice, 'local'
+            return source, 'local'
         if action == 1:
-            return min(self.edgenodes, key=lambda e: sourcedevice.distance_to(e)), 'edge'
+            return min(self.edgenodes, key=lambda n: source.distance_to(n)), 'edge'
         if action == 2:
-            return min(self.fognodes, key=lambda f: sourcedevice.distance_to(f)), 'fog'
+            return min(self.fognodes, key=lambda n: source.distance_to(n)), 'fog'
         return self.cloud, 'cloud'
 
-    def executetask(self, task, action, sourcedevice):
-        computenode, location = self.map_action_to_node(action, sourcedevice)
-        if computenode.deviceid == sourcedevice.deviceid:
-            transmissiontime = 0.0
-            propagationtime = 0.0
+    def executetask(self, task, action, source):
+        node, location = self.map_action_to_node(action, source)
+
+        if node.deviceid == source.deviceid:
+            transmission = 0.0
+            propagation = 0.0
         else:
-            transmissiontime = (task.datasize * 8.0) / max(computenode.bandwidthmbps, 1e-9)
-            propagationtime = sourcedevice.propagation_delay_to(computenode)
+            transmission = (
+                task.datasize * 8.0
+            ) / max(node.bandwidthmbps, 1e-9)
+            propagation = source.propagation_delay_to(node)
 
-        ready_time = self.currenttime + transmissiontime + propagationtime
-        waitingtime = max(0.0, computenode.busy_until - ready_time)
-        exectimems = task.cpurequirement / max(computenode.mips, 1e-9)
-        latency = transmissiontime + propagationtime + waitingtime + exectimems
-
-        exectimesec = exectimems / 1000.0
-        transmissionsec = (transmissiontime + propagationtime) / 1000.0
-        energy = computenode.powerwatts * exectimesec + 0.2 * transmissionsec
-
-        task.waitingtime = waitingtime
-        task.servicetime = exectimems
-        task.executionlocation = location
-        task.computenode = computenode.deviceid
-        task.starttime = ready_time + waitingtime
-        task.completiontime = task.starttime + exectimems
-
-        computenode.busy_until = task.completiontime
-        computenode.availablecpu = max(
-            5.0,
-            100.0 * max(0.0, 1.0 - min(1.0, exectimems / max(task.deadline, 1.0)))
+        ready = self.currenttime + transmission + propagation
+        waiting = max(0.0, node.busy_until - ready)
+        execution = task.cpurequirement / max(node.mips, 1e-9)
+        latency = transmission + propagation + waiting + execution
+        energy = (
+            node.powerwatts * execution / 1000.0
+            + 0.2 * (transmission + propagation) / 1000.0
         )
 
+        task.waitingtime = waiting
+        task.servicetime = execution
+        task.executionlocation = location
+        task.computenode = node.deviceid
+        task.starttime = ready + waiting
+        task.completiontime = task.starttime + execution
+        task.actuallatency = latency
+        task.energyconsumed = energy
+        task.executed = True
+
+        node.busy_until = task.completiontime
+        node.availablecpu = max(
+            5.0,
+            100.0 * max(
+                0.0,
+                1.0 - min(1.0, execution / max(task.deadline, 1.0))
+            )
+        )
         return latency, energy
 
     def calculatereward(self, task, latency, energy):
-        # Deadline- and latency-dominant reward; energy is secondary
         deadline = max(task.deadline, 1e-6)
-        priority_weight = 1.0 + 0.2 * float(task.priority)
+        priority_weight = 1.0 + 0.2 * task.priority
         normalized_latency = latency / deadline
-        waiting_penalty = getattr(task, 'waitingtime', 0.0) / deadline
+        waiting_penalty = task.waitingtime / deadline
 
         if latency <= task.deadline:
-            slack_ratio = (task.deadline - latency) / deadline
             reward = 20.0 * priority_weight
-            reward += 10.0 * slack_ratio
+            reward += 10.0 * (task.deadline - latency) / deadline
             reward -= 3.0 * normalized_latency
             reward -= 0.2 * energy
             reward -= 2.0 * waiting_penalty
         else:
-            tardiness_ratio = (latency - task.deadline) / deadline
             reward = -35.0 * priority_weight
-            reward -= 25.0 * tardiness_ratio
+            reward -= 25.0 * (latency - task.deadline) / deadline
             reward -= 0.5 * energy
             reward -= 3.0 * waiting_penalty
 
         return float(np.clip(reward, -100.0, 40.0))
 
     def estimate_action_outcome(self, task, action, source):
-        if action == 0:
-            node = source
-        elif action == 1:
-            node = min(self.edgenodes, key=lambda e: source.distance_to(e))
-        elif action == 2:
-            node = min(self.fognodes, key=lambda f: source.distance_to(f))
-        else:
-            node = self.cloud
-
-        transmission = 0.0 if node.deviceid == source.deviceid else (task.datasize * 8.0) / max(node.bandwidthmbps, 1e-9)
-        propagation = 0.0 if node.deviceid == source.deviceid else source.propagation_delay_to(node)
-        ready_time = self.currenttime + transmission + propagation
-        waiting = max(0.0, node.busy_until - ready_time)
-        exec_time = task.cpurequirement / max(node.mips, 1e-9)
-        total_latency = transmission + propagation + waiting + exec_time
-        energy = node.powerwatts * (exec_time / 1000.0) + 0.2 * ((transmission + propagation) / 1000.0)
-        slack_after = task.deadline - total_latency
-
-        return {
-            'node': node,
-            'latency': total_latency,
-            'energy': energy,
-            'waiting': waiting,
-            'exec_time': exec_time,
-            'slack_after': slack_after,
-        }
+        node, _ = self.map_action_to_node(action, source)
+        latency, energy = self.estimate_node_outcome(task, node, source)
+        return {'latency': latency, 'energy': energy}
 
     def get_valid_actions(self, task, source):
-        # Stricter feasibility: only actions predicted to meet deadline are valid.
         valid = []
-        fallback = []
+        all_actions = []
+
         for action in range(4):
             info = self.estimate_action_outcome(task, action, source)
-            fallback.append((action, info['slack_after']))
-            if info['slack_after'] >= 0.0:
+            all_actions.append((action, info['latency']))
+            if info['latency'] <= task.deadline:
                 valid.append(action)
+
         if valid:
             return valid
-        # If all actions miss, choose the least-bad (maximum slack_after)
-        fallback.sort(key=lambda x: x[1], reverse=True)
-        return [fallback[0][0]]
+
+        all_actions.sort(key=lambda item: item[1])
+        return [all_actions[0][0]]
 
     def select_apqs_action(self, state, task, source):
         valid_actions = self.get_valid_actions(task, source)
 
-        # Exploration
-        if hasattr(self.agent, 'epsilon') and random.random() <= self.agent.epsilon:
+        if random.random() <= self.agent.epsilon:
             return random.choice(valid_actions)
-        if (not TF_AVAILABLE) or (self.agent.model is None):
+        if not TF_AVAILABLE or self.agent.model is None:
             return random.choice(valid_actions)
 
-        q_values = self.agent.model.predict(state[np.newaxis, :], verbose=0)[0]
-
-        # Soft bias: prefer local/edge/fog over cloud when Q-values are similar
-        # action index: 0=local, 1=edge, 2=fog, 3=cloud
-        latency_bias = np.array([0.05, 0.02, 0.0, -0.05], dtype=np.float32)
-
-        masked_q = np.full_like(q_values, -1e9, dtype=np.float32)
-        for a in valid_actions:
-            masked_q[a] = q_values[a] + latency_bias[a]
-
-        return int(np.argmax(masked_q))
+        q_values = self.agent.model.predict(
+            state[np.newaxis, :], verbose=0
+        )[0]
+        bias = np.array([0.05, 0.02, 0.0, -0.05], dtype=np.float32)
+        masked = np.full_like(q_values, -1e9)
+        for action in valid_actions:
+            masked[action] = q_values[action] + bias[action]
+        return int(np.argmax(masked))
 
     def runsimulation(self, durationms=30000, arrivalrate=0.1, verbose=False):
         self.reset_runtime()
@@ -462,21 +482,17 @@ class EdgeFogSimulator:
 
         while self.currenttime < durationms:
             if random.random() < arrivalrate:
-                self.scheduler.addtask(self.generatetask())
+                task = self.generatetask()
+                task.source_device = random.choice(self.iotdevices)
+                self.submittedtasks.append(task)
+                self.admit_task(task, task.source_device)
 
             while not self.scheduler.isempty():
                 task = self.scheduler.getnexttask()
-                if task is None:
-                    break
-
-                source = random.choice(self.iotdevices)
+                source = task.source_device
                 state = self.getstate(task, source)
                 action = self.select_apqs_action(state, task, source)
-
                 latency, energy = self.executetask(task, action, source)
-                task.actuallatency = latency
-                task.energyconsumed = energy
-
                 reward = self.calculatereward(task, latency, energy)
                 nextstate = self.getstate(task, source)
                 self.agent.remember(state, action, reward, nextstate, True)
@@ -491,28 +507,43 @@ class EdgeFogSimulator:
         return self.calculateresults()
 
     def calculateresults(self):
-        if not self.completedtasks:
-            return {
-                'total_tasks': 0,
-                'avg_latency': 0.0,
-                'p99_latency': 0.0,
-                'avg_energy': 0.0,
-                'deadline_met_rate': 0.0,
-                'failed_tasks': 0
-            }
+        executed_tasks = len(self.completedtasks)
+        accepted_objects = [
+            task for task in self.completedtasks
+            if task.meetsdeadline()
+        ]
+        accepted_tasks = len(accepted_objects)
+        failed_tasks = executed_tasks - accepted_tasks
 
-        latencies = np.array([t.actuallatency for t in self.completedtasks], dtype=float)
-        energies = np.array([t.energyconsumed for t in self.completedtasks], dtype=float)
-        deadlinemet = sum(1 for t in self.completedtasks if t.meetsdeadline())
+        latencies = np.asarray(
+            [task.actuallatency for task in accepted_objects],
+            dtype=float
+        )
+        energies = np.asarray(
+            [task.energyconsumed for task in accepted_objects],
+            dtype=float
+        )
 
         return {
-            'total_tasks': int(len(self.completedtasks)),
-            'avg_latency': float(np.mean(latencies)),
-            'p50_latency': float(np.percentile(latencies, 50)),
-            'p99_latency': float(np.percentile(latencies, 99)),
-            'avg_energy': float(np.mean(energies)),
-            'deadline_met_rate': float(deadlinemet / len(self.completedtasks) * 100.0),
-            'failed_tasks': int(len(self.completedtasks) - deadlinemet),
+            'submitted_tasks': len(self.submittedtasks),
+            'executed_tasks': executed_tasks,
+            'accepted_tasks': accepted_tasks,
+            'failed_tasks': failed_tasks,
+            'rejected_tasks': 0,
+            'completed_tasks': executed_tasks,
+            'total_tasks': executed_tasks,
+            'avg_latency': float(np.mean(latencies)) if len(latencies) else 0.0,
+            'p50_latency': float(np.percentile(latencies, 50)) if len(latencies) else 0.0,
+            'p99_latency': float(np.percentile(latencies, 99)) if len(latencies) else 0.0,
+            'avg_energy': float(np.mean(energies)) if len(energies) else 0.0,
+            'deadline_met_rate': float(
+                accepted_tasks / executed_tasks * 100.0
+                if executed_tasks else 0.0
+            ),
+            'acceptance_rate': float(
+                accepted_tasks / len(self.submittedtasks) * 100.0
+                if self.submittedtasks else 0.0
+            )
         }
 
 
@@ -530,14 +561,10 @@ class StaticThresholdScheduler:
 
 
 class FCFSScheduler:
-    def __init__(self):
-        self.queuethresholdhigh = 30
-        self.queuethresholdmedium = 15
-
     def decide(self, task, queuelength):
-        if queuelength >= self.queuethresholdhigh:
+        if queuelength >= 30:
             return 3
-        if queuelength >= self.queuethresholdmedium:
+        if queuelength >= 15:
             return 2
         return 1
 
@@ -547,76 +574,81 @@ class GeneticAlgorithmScheduler:
         self.populationsize = populationsize
         self.generations = generations
         self.mutationrate = mutationrate
-        self.numlocations = 4
 
     def createindividual(self, numtasks):
-        return [random.randint(0, self.numlocations - 1) for _ in range(numtasks)]
+        return [random.randint(0, 3) for _ in range(numtasks)]
 
     def estimated_latency_energy(self, task, location):
-        if location == 0:
-            latency = task.cpurequirement / 1000.0
-            energy = 3.0 * (latency / 1000.0)
-        elif location == 1:
-            latency = (task.datasize * 8.0 / 200.0) + (task.cpurequirement / 3000.0)
-            energy = 75.0 * ((task.cpurequirement / 3000.0) / 1000.0)
-        elif location == 2:
-            latency = (task.datasize * 8.0 / 750.0) + (task.cpurequirement / 6000.0)
-            energy = 225.0 * ((task.cpurequirement / 6000.0) / 1000.0)
-        else:
-            latency = (task.datasize * 8.0 / 5000.0) + (task.cpurequirement / 16000.0)
-            energy = 15.0 * ((task.cpurequirement / 16000.0) / 1000.0)
-        return latency, energy
+        values = [
+            (1000.0, 3.0, 0.0),
+            (3000.0, 75.0, task.datasize * 8.0 / 200.0),
+            (6000.0, 225.0, task.datasize * 8.0 / 750.0),
+            (16000.0, 15.0, task.datasize * 8.0 / 5000.0)
+        ]
+        mips, power, transmission = values[location]
+        execution = task.cpurequirement / mips
+        return transmission + execution, power * execution / 1000.0
 
     def evaluatefitness(self, individual, tasks):
         total = 0.0
-        for i, task in enumerate(tasks):
-            latency, energy = self.estimated_latency_energy(task, individual[i])
-            deadline_penalty = 0 if latency <= task.deadline else 1000
-            total += 0.5 * latency + 0.2 * energy * 1000 + 0.3 * deadline_penalty
+        for index, task in enumerate(tasks):
+            latency, energy = self.estimated_latency_energy(
+                task, individual[index]
+            )
+            penalty = 0.0 if latency <= task.deadline else 1000.0
+            total += 0.5 * latency + 0.2 * energy * 1000.0 + 0.3 * penalty
         return total
 
     def crossover(self, parent1, parent2):
         if len(parent1) <= 1:
             return parent1.copy(), parent2.copy()
-        cp = random.randint(1, len(parent1) - 1)
-        return parent1[:cp] + parent2[cp:], parent2[:cp] + parent1[cp:]
+        point = random.randint(1, len(parent1) - 1)
+        return (
+            parent1[:point] + parent2[point:],
+            parent2[:point] + parent1[point:]
+        )
 
     def mutate(self, individual):
-        out = individual.copy()
-        for i in range(len(out)):
+        result = individual.copy()
+        for index in range(len(result)):
             if random.random() < self.mutationrate:
-                out[i] = random.randint(0, self.numlocations - 1)
-        return out
+                result[index] = random.randint(0, 3)
+        return result
 
     def optimize(self, tasks):
         if not tasks:
             return []
 
-        population = [self.createindividual(len(tasks)) for _ in range(self.populationsize)]
-        bestsolution = population[0]
+        population = [
+            self.createindividual(len(tasks))
+            for _ in range(self.populationsize)
+        ]
+        best = population[0]
         bestfitness = float('inf')
 
         for _ in range(self.generations):
-            fitness = [self.evaluatefitness(ind, tasks) for ind in population]
-            idx = int(np.argmin(fitness))
-
-            if fitness[idx] < bestfitness:
-                bestfitness = fitness[idx]
-                bestsolution = population[idx].copy()
-
+            fitness = [
+                self.evaluatefitness(individual, tasks)
+                for individual in population
+            ]
             order = np.argsort(fitness)
-            newpop = [population[int(order[0])].copy()]
-            if len(order) > 1:
-                newpop.append(population[int(order[1])].copy())
+            best_index = int(order[0])
 
-            while len(newpop) < self.populationsize:
-                p1, p2 = random.sample(population, 2)
-                c1, c2 = self.crossover(p1, p2)
-                newpop.extend([self.mutate(c1), self.mutate(c2)])
+            if fitness[best_index] < bestfitness:
+                bestfitness = fitness[best_index]
+                best = population[best_index].copy()
 
-            population = newpop[:self.populationsize]
+            newpopulation = [population[best_index].copy()]
+            while len(newpopulation) < self.populationsize:
+                parent1, parent2 = random.sample(population, 2)
+                child1, child2 = self.crossover(parent1, parent2)
+                newpopulation.extend([
+                    self.mutate(child1),
+                    self.mutate(child2)
+                ])
+            population = newpopulation[:self.populationsize]
 
-        return bestsolution
+        return best
 
     def decide(self, taskindex, solution):
         return solution[taskindex] if taskindex < len(solution) else 0
@@ -628,7 +660,6 @@ class FuzzyLogicScheduler:
         score += 3 if task.datasize > 100 else 2 if task.datasize > 50 else 1
         score += 2 if queuelength > 25 else 1 if queuelength > 15 else 0
         score += 2 if cpuavailable < 30 else 1 if cpuavailable < 60 else 0
-
         if score >= 5:
             return 3
         if score >= 3:
@@ -639,61 +670,75 @@ class FuzzyLogicScheduler:
 def build_baseline_environment():
     iotdevices = [
         Device(
-            f'iot{i}', 'iot',
-            1.0, 1.0, 10, 3,
+            f'iot{i}', 'iot', 1.0, 1.0, 10, 3,
             (random.uniform(0, 500), random.uniform(0, 500))
         )
         for i in range(50)
     ]
     edgenodes = [
         Device(
-            f'edge{i}', 'edge',
-            3.0, 12.0, 200, 75,
+            f'edge{i}', 'edge', 3.0, 12.0, 200, 75,
             (random.uniform(100, 400), random.uniform(100, 400))
         )
         for i in range(5)
     ]
     fognodes = [
         Device(
-            f'fog{i}', 'fog',
-            6.0, 48.0, 750, 225,
-            (250, 250)
+            f'fog{i}', 'fog', 6.0, 48.0, 750, 225, (250, 250)
         )
         for i in range(2)
     ]
-    cloud = Device('cloud0', 'cloud', 16.0, 256.0, 5000.0, 15.0, (250, 250))
+    cloud = Device(
+        'cloud0', 'cloud', 16.0, 256.0,
+        5000.0, 15.0, (250, 250)
+    )
     return iotdevices, edgenodes, fognodes, cloud
 
 
-def execute_baseline_task(task, action, source, edgenodes, fognodes, cloud, currenttime):
+def execute_baseline_task(task, action, source, edgenodes,
+                          fognodes, cloud, currenttime):
     if action == 0:
-        node = source
-        location = 'local'
+        node, location = source, 'local'
     elif action == 1:
-        node = min(edgenodes, key=lambda e: source.distance_to(e))
-        location = 'edge'
+        node, location = min(
+            edgenodes, key=lambda n: source.distance_to(n)
+        ), 'edge'
     elif action == 2:
-        node = min(fognodes, key=lambda f: source.distance_to(f))
-        location = 'fog'
+        node, location = min(
+            fognodes, key=lambda n: source.distance_to(n)
+        ), 'fog'
     else:
-        node = cloud
-        location = 'cloud'
+        node, location = cloud, 'cloud'
 
-    transmission = 0.0 if node.deviceid == source.deviceid else (task.datasize * 8.0) / max(node.bandwidthmbps, 1e-9)
-    propagation = 0.0 if node.deviceid == source.deviceid else source.propagation_delay_to(node)
+    transmission = (
+        0.0
+        if node.deviceid == source.deviceid
+        else task.datasize * 8.0 / node.bandwidthmbps
+    )
+    propagation = (
+        0.0
+        if node.deviceid == source.deviceid
+        else source.propagation_delay_to(node)
+    )
     waiting = max(0.0, node.busy_until - currenttime)
-    exectimems = task.cpurequirement / max(node.mips, 1e-9)
-    latency = transmission + propagation + waiting + exectimems
-    energy = node.powerwatts * (exectimems / 1000.0) + 0.2 * ((transmission + propagation) / 1000.0)
+    execution = task.cpurequirement / node.mips
+    latency = transmission + propagation + waiting + execution
+    energy = (
+        node.powerwatts * execution / 1000.0
+        + 0.2 * (transmission + propagation) / 1000.0
+    )
 
-    node.busy_until = currenttime + transmission + propagation + waiting + exectimems
     task.actuallatency = latency
     task.energyconsumed = energy
     task.executionlocation = location
+    task.computenode = node.deviceid
+    task.executed = True
+    node.busy_until = currenttime + latency
     return task
 
 
-def run_baseline_simulation(schedulertype, durationms=30000, arrivalrate=0.1, workload_config=None):
+def run_baseline_simulation(schedulertype, durationms=30000,
+                            arrivalrate=0.1, workload_config=None):
     cfg = workload_config or WorkloadConfig()
     iotdevices, edgenodes, fognodes, cloud = build_baseline_environment()
 
@@ -711,62 +756,85 @@ def run_baseline_simulation(schedulertype, durationms=30000, arrivalrate=0.1, wo
     tasks = []
     currenttime = 0.0
     taskid = 0
+
     while currenttime < durationms:
         if random.random() < arrivalrate:
-            tasks.append(Task(
+            task = Task(
                 taskid, currenttime,
                 random.uniform(cfg.size_low, cfg.size_high),
                 random.randint(cfg.cpu_low, cfg.cpu_high),
                 random.randint(cfg.dl_low, cfg.dl_high),
                 random.randint(cfg.priority_low, cfg.priority_high)
-            ))
+            )
+            task.source_device = random.choice(iotdevices)
+            tasks.append(task)
             taskid += 1
         currenttime += 50.0
 
-    gasolution = scheduler.optimize(tasks) if schedulertype == 'ga' else None
-
+    solution = scheduler.optimize(tasks) if schedulertype == 'ga' else None
     completedtasks = []
-    queuelength = len(tasks)
     currenttime = 0.0
 
-    for i, task in enumerate(tasks):
-        source = random.choice(iotdevices)
+    for index, task in enumerate(tasks):
+        source = task.source_device
+        remaining = len(tasks) - index
 
         if schedulertype == 'static':
             action = scheduler.decide(task)
         elif schedulertype == 'fcfs':
-            action = scheduler.decide(task, queuelength)
+            action = scheduler.decide(task, remaining)
         elif schedulertype == 'ga':
-            action = scheduler.decide(i, gasolution)
+            action = scheduler.decide(index, solution)
         else:
-            action = scheduler.decide(task, queuelength, random.uniform(40, 90))
+            action = scheduler.decide(
+                task, remaining, random.uniform(40, 90)
+            )
 
-        completedtasks.append(execute_baseline_task(task, action, source, edgenodes, fognodes, cloud, currenttime))
-        queuelength -= 1
+        completedtasks.append(
+            execute_baseline_task(
+                task, action, source, edgenodes,
+                fognodes, cloud, currenttime
+            )
+        )
         currenttime += 50.0
 
-    if not completedtasks:
-        return {
-            'total_tasks': 0,
-            'avg_latency': 0.0,
-            'p99_latency': 0.0,
-            'avg_energy': 0.0,
-            'deadline_met_rate': 0.0,
-            'failed_tasks': 0
-        }
+    accepted_objects = [
+        task for task in completedtasks
+        if task.meetsdeadline()
+    ]
+    accepted_tasks = len(accepted_objects)
+    executed_tasks = len(completedtasks)
+    failed_tasks = executed_tasks - accepted_tasks
 
-    latencies = np.array([t.actuallatency for t in completedtasks], dtype=float)
-    energies = np.array([t.energyconsumed for t in completedtasks], dtype=float)
-    deadlinemet = sum(1 for t in completedtasks if t.meetsdeadline())
+    latencies = np.asarray(
+        [task.actuallatency for task in accepted_objects],
+        dtype=float
+    )
+    energies = np.asarray(
+        [task.energyconsumed for task in accepted_objects],
+        dtype=float
+    )
 
     return {
-        'total_tasks': int(len(completedtasks)),
-        'avg_latency': float(np.mean(latencies)),
-        'p50_latency': float(np.percentile(latencies, 50)),
-        'p99_latency': float(np.percentile(latencies, 99)),
-        'avg_energy': float(np.mean(energies)),
-        'deadline_met_rate': float(deadlinemet / len(completedtasks) * 100.0),
-        'failed_tasks': int(len(completedtasks) - deadlinemet),
+        'submitted_tasks': len(tasks),
+        'executed_tasks': executed_tasks,
+        'accepted_tasks': accepted_tasks,
+        'rejected_tasks': 0,
+        'completed_tasks': executed_tasks,
+        'total_tasks': executed_tasks,
+        'avg_latency': float(np.mean(latencies)) if len(latencies) else 0.0,
+        'p50_latency': float(np.percentile(latencies, 50)) if len(latencies) else 0.0,
+        'p99_latency': float(np.percentile(latencies, 99)) if len(latencies) else 0.0,
+        'avg_energy': float(np.mean(energies)) if len(energies) else 0.0,
+        'deadline_met_rate': float(
+            accepted_tasks / executed_tasks * 100.0
+            if executed_tasks else 0.0
+        ),
+        'failed_tasks': failed_tasks,
+        'acceptance_rate': float(
+            accepted_tasks / len(tasks) * 100.0
+            if tasks else 0.0
+        )
     }
 
 
@@ -778,6 +846,8 @@ class ResultsAnalyzer:
             rows.append({
                 'Approach': name,
                 'Total Tasks': results['total_tasks'],
+                'Executed Tasks': results.get('executed_tasks', 0),
+                'Accepted Tasks': results.get('accepted_tasks', 0),
                 'Avg Latency (ms)': round(results['avg_latency'], 4),
                 'P50 Latency (ms)': round(results.get('p50_latency', 0.0), 4),
                 'P99 Latency (ms)': round(results['p99_latency'], 4),
@@ -792,101 +862,117 @@ class ResultsAnalyzer:
         approaches = list(allresults.keys())
         latencies = [allresults[a]['avg_latency'] for a in approaches]
         energies = [allresults[a]['avg_energy'] for a in approaches]
-        deadlinerates = [allresults[a]['deadline_met_rate'] for a in approaches]
+        deadline_rates = [allresults[a]['deadline_met_rate'] for a in approaches]
+        colors = [
+            'tab:blue', 'tab:orange', 'tab:green',
+            'tab:red', 'tab:purple'
+        ][:len(approaches)]
 
-        colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple'][:len(approaches)]
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
+        _, axes = plt.subplots(1, 3, figsize=(15, 5))
         axes[0].bar(approaches, latencies, color=colors)
-        axes[0].set_title('Average Latency')
-        axes[0].tick_params(axis='x', rotation=45)
-
+        axes[0].set_title('Average Latency of Deadline-Met Tasks')
         axes[1].bar(approaches, energies, color=colors)
-        axes[1].set_title('Average Energy')
-        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].set_title('Average Energy of Deadline-Met Tasks')
+        axes[2].bar(approaches, deadline_rates, color=colors)
+        axes[2].set_title('Deadline Met (%)')
 
-        axes[2].bar(approaches, deadlinerates, color=colors)
-        axes[2].set_title('Deadline Met %')
-        axes[2].tick_params(axis='x', rotation=45)
+        for axis in axes:
+            axis.tick_params(axis='x', rotation=45)
 
         plt.tight_layout()
         plt.savefig(path, dpi=300, bbox_inches='tight')
         plt.close()
 
 
+def aggregate_results(results):
+    keys = [
+        'submitted_tasks', 'executed_tasks', 'accepted_tasks',
+        'rejected_tasks', 'completed_tasks', 'total_tasks',
+        'avg_latency', 'p50_latency', 'p99_latency',
+        'avg_energy', 'deadline_met_rate', 'failed_tasks',
+        'acceptance_rate'
+    ]
+    output = {}
+    for key in keys:
+        output[key] = float(
+            np.mean([result.get(key, 0.0) for result in results])
+        )
+    output['std_latency'] = float(
+        np.std([result.get('avg_latency', 0.0) for result in results])
+    )
+    output['std_deadline'] = float(
+        np.std([
+            result.get('deadline_met_rate', 0.0)
+            for result in results
+        ])
+    )
+    return output
+
+
 def ablation_apqs_nopq(durationms=30000, arrivalrate=0.1, num_runs=5):
-    all_results = []
+    results = []
     for _ in range(num_runs):
-        simulator = EdgeFogSimulator(num_iot=50, num_edge=5, num_fog=2)
+        simulator = EdgeFogSimulator()
         simulator.scheduler = NoPriorityScheduler()
-        all_results.append(simulator.runsimulation(durationms, arrivalrate, verbose=False))
-
-    return {
-        'total_tasks': float(np.mean([r['total_tasks'] for r in all_results])),
-        'avg_latency': float(np.mean([r['avg_latency'] for r in all_results])),
-        'p99_latency': float(np.mean([r['p99_latency'] for r in all_results])),
-        'avg_energy': float(np.mean([r['avg_energy'] for r in all_results])),
-        'deadline_met_rate': float(np.mean([r['deadline_met_rate'] for r in all_results])),
-        'failed_tasks': float(np.mean([r['failed_tasks'] for r in all_results])),
-        'std_latency': float(np.std([r['avg_latency'] for r in all_results])),
-        'std_deadline': float(np.std([r['deadline_met_rate'] for r in all_results])),
-    }
+        results.append(
+            simulator.runsimulation(durationms, arrivalrate)
+        )
+    return aggregate_results(results)
 
 
-def ablation_apqs_noenergy(durationms=30000, arrivalrate=0.1, num_runs=5):
+def ablation_apqs_noenergy(durationms=30000, arrivalrate=0.1,
+                           num_runs=5):
     original = EdgeFogSimulator.calculatereward
 
     def calculatereward_noenergy(self, task, latency, energy):
         latency_penalty = latency / max(task.deadline, 1.0)
         deadline_term = 1.0 if latency <= task.deadline else -1.0
-        priority_term = (task.priority / 10.0) * (1.0 if latency <= task.deadline else -0.5)
-        return float(-(0.45 * latency_penalty) + 0.45 * deadline_term + 0.10 * priority_term)
+        priority_term = task.priority / 10.0 * deadline_term
+        return float(
+            -0.45 * latency_penalty
+            + 0.45 * deadline_term
+            + 0.10 * priority_term
+        )
 
-    all_results = []
+    results = []
     try:
         EdgeFogSimulator.calculatereward = calculatereward_noenergy
         for _ in range(num_runs):
-            simulator = EdgeFogSimulator(num_iot=50, num_edge=5, num_fog=2)
-            all_results.append(simulator.runsimulation(durationms, arrivalrate, verbose=False))
+            results.append(
+                EdgeFogSimulator().runsimulation(
+                    durationms, arrivalrate
+                )
+            )
     finally:
         EdgeFogSimulator.calculatereward = original
 
-    return {
-        'total_tasks': float(np.mean([r['total_tasks'] for r in all_results])),
-        'avg_latency': float(np.mean([r['avg_latency'] for r in all_results])),
-        'p99_latency': float(np.mean([r['p99_latency'] for r in all_results])),
-        'avg_energy': float(np.mean([r['avg_energy'] for r in all_results])),
-        'deadline_met_rate': float(np.mean([r['deadline_met_rate'] for r in all_results])),
-        'failed_tasks': float(np.mean([r['failed_tasks'] for r in all_results])),
-        'std_latency': float(np.std([r['avg_latency'] for r in all_results])),
-        'std_deadline': float(np.std([r['deadline_met_rate'] for r in all_results])),
-    }
+    return aggregate_results(results)
 
 
 def run_ablation_study(durationms=30000, arrivalrate=0.2, num_runs=5):
-    results = {}
-    results['APQS-NoPQ'] = ablation_apqs_nopq(durationms, arrivalrate, num_runs)
-    results['APQS-NoEnergy'] = ablation_apqs_noenergy(durationms, arrivalrate, num_runs)
-
-    full = []
-    for _ in range(num_runs):
-        simulator = EdgeFogSimulator(num_iot=50, num_edge=5, num_fog=2)
-        full.append(simulator.runsimulation(durationms, arrivalrate, verbose=False))
-
-    results['APQS (Full)'] = {
-        'total_tasks': float(np.mean([r['total_tasks'] for r in full])),
-        'avg_latency': float(np.mean([r['avg_latency'] for r in full])),
-        'p99_latency': float(np.mean([r['p99_latency'] for r in full])),
-        'avg_energy': float(np.mean([r['avg_energy'] for r in full])),
-        'deadline_met_rate': float(np.mean([r['deadline_met_rate'] for r in full])),
-        'failed_tasks': float(np.mean([r['failed_tasks'] for r in full])),
-        'std_latency': float(np.std([r['avg_latency'] for r in full])),
-        'std_deadline': float(np.std([r['deadline_met_rate'] for r in full])),
+    results = {
+        'APQS-NoPQ': ablation_apqs_nopq(
+            durationms, arrivalrate, num_runs
+        ),
+        'APQS-NoEnergy': ablation_apqs_noenergy(
+            durationms, arrivalrate, num_runs
+        )
     }
 
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with open(os.path.join('output', f'ablation_study_{ts}.json'), 'w') as f:
-        json.dump(results, f, indent=2)
+    full = [
+        EdgeFogSimulator().runsimulation(
+            durationms, arrivalrate
+        )
+        for _ in range(num_runs)
+    ]
+    results['APQS (Full)'] = aggregate_results(full)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    with open(
+        os.path.join('output', f'ablation_study_{timestamp}.json'),
+        'w', encoding='utf-8'
+    ) as file:
+        json.dump(results, file, indent=2)
 
     return results
 
@@ -894,22 +980,31 @@ def run_ablation_study(durationms=30000, arrivalrate=0.2, num_runs=5):
 def main():
     duration = 30000
     arrivalrate = 0.1
+    simulator = EdgeFogSimulator()
 
-    simulator = EdgeFogSimulator(num_iot=50, num_edge=5, num_fog=2)
     allresults = {
-        'DQN + Priority': simulator.runsimulation(duration, arrivalrate, verbose=False),
-        'Static Threshold': run_baseline_simulation('static', duration, arrivalrate),
-        'FCFS': run_baseline_simulation('fcfs', duration, arrivalrate),
-        'Genetic Algorithm': run_baseline_simulation('ga', duration, arrivalrate),
-        'Fuzzy Logic': run_baseline_simulation('fuzzy', duration, arrivalrate),
+        'DQN + Priority': simulator.runsimulation(
+            duration, arrivalrate
+        ),
+        'Static Threshold': run_baseline_simulation(
+            'static', duration, arrivalrate
+        ),
+        'FCFS': run_baseline_simulation(
+            'fcfs', duration, arrivalrate
+        ),
+        'Genetic Algorithm': run_baseline_simulation(
+            'ga', duration, arrivalrate
+        ),
+        'Fuzzy Logic': run_baseline_simulation(
+            'fuzzy', duration, arrivalrate
+        )
     }
 
     analyzer = ResultsAnalyzer()
-    df = analyzer.compareall(allresults)
-    df.to_csv('output/debugged_results.csv', index=False)
+    dataframe = analyzer.compareall(allresults)
+    dataframe.to_csv('output/debugged_results.csv', index=False)
     analyzer.plotcomparison(allresults, 'output/comparison.png')
-
-    return allresults, df
+    return allresults, dataframe
 
 
 if __name__ == '__main__':
